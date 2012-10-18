@@ -52,6 +52,7 @@ declare -i CURL_INSECURE=0
 declare -i VERBOSE=0
 declare -i IGNORE_DEPLOYED=0
 declare -i DRY_RUN=0
+declare -i SAFE_PUSH=0
 declare -i FORCE=0
 declare -i ENABLE_REMOTE_LCK=0
 declare -i ACTIVE_MODE=0
@@ -136,6 +137,7 @@ OPTIONS
 	-k, --keychain		FTP password from KeyChain (Mac OS X only).
 	-s, --scope		Using a scope (e.g. dev, production, testing).
 	-D, --dry-run		Dry run: Does not upload anything.
+	-S, --safe-push         Aborts push if remote files are changed
 	-a, --all		Uploads all files, ignores deployed SHA1 hash.
 	-c, --commit		Sets SHA1 hash of last deployed commit by option.
 	-A, --active		Use FTP active mode.
@@ -432,6 +434,30 @@ get_file_content() {
 	CURL_ARGS+=("$REMOTE_PROTOCOL://$REMOTE_HOST/${REMOTE_PATH}${SRC_FILE}")
 	curl "${CURL_ARGS[@]}"
 }
+
+download_file() {
+	local SRC_FILE="$1"
+	set_default_curl_options
+        CURL_ARGS+=("$REMOTE_PROTOCOL://$REMOTE_HOST/${REMOTE_PATH}${SRC_FILE}")
+        CURL_ARGS+=(-o ${SRC_FILE})
+	curl "${CURL_ARGS[@]}"
+        check_exit_status "Could not download file: '${REMOTE_PATH}$DEST_FILE'." $ERROR_DOWNLOAD
+}
+
+download_changed_files() {
+	# Changing internal field separator, file names could have spaces
+	OIFS="$IFS"
+	# dash does not like NIFS=$'\n', using WYSIWYG
+	NIFS=$'
+'
+	IFS="$NIFS"
+	for FILE_ITERATOR in $FILES_CHANGED; do
+		FILE_NAME=$(echo "$FILE_ITERATOR" | cut  -d ' ' -f 2)
+		download_file $FILE_NAME
+	done
+	IFS="$OIFS"
+}
+
 
 upload_local_sha1() {
 	DEPLOYED_SHA1=$(git log -n 1 --pretty=format:%H)
@@ -811,6 +837,7 @@ action_push() {
 	set_remotes
 	set_deployed_sha1
 	set_changed_files
+        check_remote_files
 	remote_lock
 	handle_file_sync
 	upload_local_sha1
@@ -893,6 +920,38 @@ check_is_git_project() {
 
 check_is_dirty_repository() {
 	[ $(git status -uno --porcelain | wc -l) -ne 0 ] && print_error_and_die "Dirty repository: Having uncommitted changes. Exiting..." $ERROR_GIT
+}
+
+check_remote_files(){
+	if [ $SAFE_PUSH -eq 0 ]; then
+		return
+	fi
+	download_changed_files
+	# Changing internal field separator, file names could have spaces
+	OIFS="$IFS"
+	# dash does not like NIFS=$'\n', using WYSIWYG
+	NIFS=$'
+'
+	IFS="$NIFS"
+	for FILE_ITERATOR in $FILES_CHANGED; do
+		FILE_MODE=$(echo "$FILE_ITERATOR" | cut -d ' ' -f 1)
+		FILE_NAME=$(echo "$FILE_ITERATOR" | cut -d ' ' -f 2)
+		if [ "$FILE_MODE" = "M" ]; then
+			DIFF_RESULT="$(git diff --name-only $DEPLOYED_SHA1 $FILE_NAME 2>/dev/null)"
+			if [ "$DIFF_RESULT" != "" ]; then
+				REMOTE_FILES_CHANGED="$REMOTE_FILES_CHANGED
+$DIFF_RESULT"
+			fi
+		fi
+	done
+	IFS="$OIFS"
+	#REMOTE_FILES_CHANGED="$(git diff --name-only $DEPLOYED_SHA1 . 2>/dev/null)"
+	git reset --hard HEAD >/dev/null
+	if [ "$REMOTE_FILES_CHANGED" = "" ]; then
+		echo "Remote files are unchanged."
+	else
+		print_error_and_die "Aborting push. These files are changed on remote server:$REMOTE_FILES_CHANGED"
+	fi
 }
 
 # ------------------------------------------------------------
@@ -1052,6 +1111,10 @@ do
 			DRY_RUN=1
 			write_log "Running dry, won't do anything."
 			;;
+		-S|--safe-push)
+			SAFE_PUSH=1
+			write_log "Push will be aborted if remote files are changed"
+                        ;;
 		-n|--silent)
 			VERBOSE=-1
 			REMOTE_CMD_OPTIONS="-s"
